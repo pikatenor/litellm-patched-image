@@ -79,9 +79,12 @@ jobs:
           # Reads installed package METADATA for the exact pinned digest.
           # importlib.metadata does not import the package, so it cannot fail
           # on optional deps — only on a missing/renamed distribution.
+          # --entrypoint bypasses the upstream prod_entrypoint.sh (which would
+          # otherwise route our args through the litellm CLI: "Unknown command").
           VER="$(docker run --rm --platform linux/amd64 \
+            --entrypoint /app/.venv/bin/python \
             "${UPSTREAM_IMAGE}:${UPSTREAM_TAG}@${UPSTREAM_DIGEST}" \
-            /app/.venv/bin/python -c 'import importlib.metadata as m; print(m.version("litellm"))')"
+            -c 'import importlib.metadata as m; print(m.version("litellm"))')"
           VER="$(printf '%s' "$VER" | tr -d '[:space:]')"
           if ! printf '%s' "$VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
             echo "::error::Could not resolve LiteLLM version (got: '$VER')"
