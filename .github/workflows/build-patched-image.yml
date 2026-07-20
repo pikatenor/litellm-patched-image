@@ -1,0 +1,164 @@
+name: Build patched LiteLLM image
+
+# Rebuilds the patched image (Dockerfile + Pillow on top of the official
+# litellm-database image) whenever the upstream `main-stable` image moves,
+# and publishes it to GHCR with rolling + version tags.
+#
+# Triggers:
+#   - schedule:    daily digest check (short-circuits when nothing changed)
+#   - dispatch:    manual, with an optional `force` toggle
+#   - push:        rebuild when the Dockerfile / this workflow change
+
+on:
+  schedule:
+    - cron: '17 6 * * *' # 06:17 UTC daily
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Force a rebuild even if upstream is unchanged
+        type: boolean
+        default: false
+  push:
+    branches: [main, master]
+    paths:
+      - Dockerfile
+      - .github/workflows/build-patched-image.yml
+
+permissions:
+  contents: write # commit the state file back
+  packages: write # push to GHCR
+
+concurrency:
+  group: build-patched-image
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_IMAGE: ghcr.io/berriai/litellm-database
+  UPSTREAM_TAG: main-stable
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      skipped: ${{ env.SKIP }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image ref and platforms
+        run: |
+          echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+          # Multiarch-ready: set repo variable LITELLM_PLATFORMS=linux/amd64,linux/arm64 to add arm64.
+          echo "PLATFORMS=${{ vars.LITELLM_PLATFORMS || 'linux/amd64' }}" >> "$GITHUB_ENV"
+
+      - name: Compare upstream digest
+        env:
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force || '' }}
+        run: |
+          # crane reads the public upstream manifest digest (anonymous).
+          curl -sL "https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin crane
+          CUR="$(crane digest "${UPSTREAM_IMAGE}:${UPSTREAM_TAG}")"
+          PREV=""
+          [ -f .github/upstream-state.json ] && PREV="$(jq -r .digest .github/upstream-state.json)"
+          echo "Current digest:  $CUR"
+          echo "Previous digest: ${PREV:-<none>}"
+          if [ "$CUR" = "$PREV" ] && [ "$EVENT" != "push" ] && [ "$FORCE" != "true" ]; then
+            echo "SKIP=1" >> "$GITHUB_ENV"
+            echo "Upstream unchanged; skipping build."
+          else
+            echo "SKIP=0" >> "$GITHUB_ENV"
+          fi
+          echo "UPSTREAM_DIGEST=$CUR" >> "$GITHUB_ENV"
+          echo "SHORT_DIGEST=$(printf '%s' "${CUR#sha256:}" | cut -c1-12)" >> "$GITHUB_ENV"
+
+      # Everything below is skipped on no-op scheduled runs.
+      - name: Resolve LiteLLM version
+        if: env.SKIP != '1'
+        run: |
+          # Reads installed package METADATA for the exact pinned digest.
+          # importlib.metadata does not import the package, so it cannot fail
+          # on optional deps — only on a missing/renamed distribution.
+          VER="$(docker run --rm --platform linux/amd64 \
+            "${UPSTREAM_IMAGE}:${UPSTREAM_TAG}@${UPSTREAM_DIGEST}" \
+            /app/.venv/bin/python -c 'import importlib.metadata as m; print(m.version("litellm"))')"
+          VER="$(printf '%s' "$VER" | tr -d '[:space:]')"
+          if ! printf '%s' "$VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Could not resolve LiteLLM version (got: '$VER')"
+            exit 1
+          fi
+          echo "VERSION=$VER" >> "$GITHUB_ENV"
+          echo "Resolved LiteLLM version: $VER"
+
+      - name: Set up QEMU
+        if: env.SKIP != '1'
+        uses: docker/setup-qemu-action@v3 # always installed so arm64 is a variable-only change later
+
+      - name: Set up Buildx
+        if: env.SKIP != '1'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: env.SKIP != '1'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadata (tags and labels)
+        if: env.SKIP != '1'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ env.UPSTREAM_TAG }}
+            type=raw,value=latest
+            type=raw,value=${{ env.UPSTREAM_TAG }}-${{ env.SHORT_DIGEST }}
+            type=raw,value=${{ env.VERSION }}
+            type=raw,value=v${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.title=litellm-patch
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.base.name=${{ env.UPSTREAM_IMAGE }}:${{ env.UPSTREAM_TAG }}
+            org.opencontainers.image.base.digest=${{ env.UPSTREAM_DIGEST }}
+
+      - name: Build and push
+        if: env.SKIP != '1'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            LITELLM_TAG=${{ env.UPSTREAM_TAG }}@${{ env.UPSTREAM_DIGEST }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Record upstream state
+        if: env.SKIP != '1'
+        run: |
+          mkdir -p .github
+          jq -n \
+            --arg tag "$UPSTREAM_TAG" \
+            --arg version "$VERSION" \
+            --arg digest "$UPSTREAM_DIGEST" \
+            --arg image "$IMAGE" \
+            --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{tag:$tag, version:$version, digest:$digest, image:$image, built_at:$built_at}' \
+            > .github/upstream-state.json
+          cat .github/upstream-state.json
+
+      - name: Commit state
+        if: env.SKIP != '1'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/upstream-state.json
+          git commit -m "chore: bump upstream digest to ${SHORT_DIGEST} [skip ci]" || exit 0
+          git push
