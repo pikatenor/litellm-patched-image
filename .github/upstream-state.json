@@ -1,7 +1,7 @@
 {
   "tag": "main-stable",
-  "version": "1.109.0",
-  "digest": "sha256:5b645ba56f839a402905fed102b35f1c2dcfb190fd2f0d8cbc0f850ed442a9a4",
+  "version": "1.109.1",
+  "digest": "sha256:932c54440654f8f8466a85887612d95dcfb04ae2fc01257844332f4bf3b96986",
   "image": "ghcr.io/pikatenor/litellm-patched-image",
-  "built_at": "2026-11-11T14:32:01Z"
+  "built_at": "2026-11-12T15:24:41Z"
 }
